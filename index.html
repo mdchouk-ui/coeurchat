@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8"/>
+  <title>Cœur Chat Paris – collaboratif</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css"/>
+  <style>
+    html, body { height:100%; margin:0; }
+    #map { height:100%; }
+    .panel { position:absolute; top:10px; right:10px; z-index:1000; background:#fff; border-radius:8px; box-shadow:0 2px 10px rgba(0,0,0,.2); width:340px; max-height:90vh; overflow:hidden; display:flex; flex-direction:column; font:14px system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; }
+    .panel header { padding:10px 12px; border-bottom:1px solid #eee; display:flex; gap:8px; align-items:center; }
+    .panel header .badge { background:#f5f5f5; border-radius:6px; padding:2px 8px; }
+    .panel .row { padding:10px 12px; border-bottom:1px solid #f2f2f2; }
+    .panel .btns { display:flex; flex-wrap:wrap; gap:8px; }
+    .toggles { display:flex; gap:14px; flex-wrap:wrap; }
+    button { background:#2b7fff; color:#fff; border:none; border-radius:6px; padding:6px 10px; cursor:pointer; }
+    button.secondary { background:#666; } button.warn { background:#d64545; }
+    .list { overflow:auto; padding:8px 12px; flex:1; }
+    .item { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:4px 0; border-bottom:1px dashed #eee;}
+    .item .idx { color:#666; width:36px; } .muted{color:#666}
+  </style>
+</head>
+<body>
+<div id="map"></div>
+
+<div class="panel" id="ui">
+  <header><strong>Cœur Chat – points (collab)</strong><span class="badge" id="count">0/500</span></header>
+
+  <div class="row">
+    <div class="toggles">
+      <label><input type="checkbox" id="toggle-trace" checked> Tracé</label>
+      <label><input type="checkbox" id="toggle-points" checked> Points</label>
+    </div>
+    <div class="muted" style="margin-top:6px">Clic : ajouter • Glisser : déplacer • Clic droit : supprimer</div>
+  </div>
+
+  <div class="row">
+    <div class="btns">
+      <button id="export-geojson">Exporter GeoJSON</button>
+      <button id="export-csv" class="secondary">Exporter CSV</button>
+      <button id="export-kml" class="secondary">Exporter KML</button>
+      <button id="clear" class="warn">Tout effacer (DB)</button>
+    </div>
+  </div>
+
+  <div class="list" id="list"><div class="muted">Chargement…</div></div>
+</div>
+
+<script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+<script type="module">
+  // ====== CONFIG SUPABASE ======
+  const SUPABASE_URL = "https://XXXXXXXXXXXX.supabase.co";     // <-- à remplacer
+  const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."; // <-- à remplacer
+  const MAP_ID = "coeurchat"; // identifiant de carte
+
+  // ====== IMPORTS ======
+  import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
+
+  // ====== INIT ======
+  const sb = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+  const map = L.map('map',{preferCanvas:true}).setView([48.8566, 2.3522], 12);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom:19}).addTo(map);
+
+  let chatLayer = null;
+  const pointsGroup = L.featureGroup().addTo(map);
+  const registry = new Map(); // id(uuid) -> marker
+  const MAX_POINTS = 500;
+
+  const $ = s => document.querySelector(s);
+  const listEl = $('#list'), countEl = $('#count');
+
+  // ====== TRACÉ COEUR CHAT ======
+  fetch('coeurchat.geojson').then(r=>r.json()).then(data=>{
+    chatLayer = L.geoJSON(data, { style:{color:'#ff2a2a', weight:3, opacity:0.9}}).addTo(map);
+    try { map.fitBounds(chatLayer.getBounds(), {padding:[30,30]}); } catch(e){}
+  }).catch(e=>console.warn('Tracé non chargé', e));
+
+  $('#toggle-trace').onchange = (e)=> {
+    if(!chatLayer) return;
+    e.target.checked ? chatLayer.addTo(map) : map.removeLayer(chatLayer);
+  };
+  $('#toggle-points').onchange = (e)=> {
+    e.target.checked ? pointsGroup.addTo(map) : map.removeLayer(pointsGroup);
+  };
+
+  // ====== CHARGEMENT DES POINTS (DB) ======
+  async function loadFromDB(){
+    const { data, error } = await sb.from('points').select('*').eq('map_id', MAP_ID).order('created_at',{ascending:true});
+    if(error){ listEl.innerHTML = `<div class="muted">Erreur chargement DB</div>`; console.error(error); return; }
+    pointsGroup.clearLayers(); registry.clear();
+    data.forEach(row => materializeRow(row));
+    updateList();
+  }
+
+  function materializeRow(row){
+    const m = L.marker([row.lat, row.lon], {draggable:true}).addTo(pointsGroup);
+    m._pid = row.id; registry.set(row.id, m);
+    m.on('dragend', async ()=>{
+      const {lat,lng} = m.getLatLng();
+      await sb.from('points').update({lat:lat, lon:lng}).eq('id', row.id);
+      updateList();
+    });
+    m.on('contextmenu', ()=> deletePoint(row.id));
+  }
+
+  // ====== AJOUT/SUPPR/VIDE ======
+  async function addPoint(latlng){
+    if (registry.size >= MAX_POINTS){ alert('Limite de 500 points atteinte.'); return; }
+    const { data, error } = await sb.from('points').insert({map_id: MAP_ID, lat: latlng.lat, lon: latlng.lng}).select().single();
+    if(error){ console.error(error); return; }
+    materializeRow(data);
+    updateList();
+  }
+  async function deletePoint(id){
+    await sb.from('points').delete().eq('id', id);
+    const m = registry.get(id); if(m){ pointsGroup.removeLayer(m); registry.delete(id); updateList(); }
+  }
+  async function clearAll(){
+    if(!confirm('Supprimer TOUS les points de la base pour cette carte ?')) return;
+    await sb.from('points').delete().eq('map_id', MAP_ID);
+    pointsGroup.clearLayers(); registry.clear(); updateList();
+  }
+
+  map.on('click', (e)=> addPoint(e.latlng));
+
+  // ====== LISTE + EXPORTS ======
+  function updateList(){
+    listEl.innerHTML = '';
+    let i=1;
+    registry.forEach((m,id)=>{
+      const {lat,lng} = m.getLatLng();
+      const row = document.createElement('div'); row.className='item';
+      row.innerHTML = `
+        <span class="idx">#${i}</span>
+        <span class="coords"><a target="_blank" href="https://www.google.com/maps?q=${lat.toFixed(6)},${lng.toFixed(6)}">${lat.toFixed(6)}, ${lng.toFixed(6)}</a></span>
+        <button class="warn">✕</button>
+      `;
+      row.querySelector('button').onclick = (ev)=>{ ev.stopPropagation(); deletePoint(id); };
+      row.onclick = ()=> map.panTo(m.getLatLng());
+      listEl.appendChild(row);
+      i++;
+    });
+    if(registry.size===0) listEl.innerHTML = '<div class="muted">Aucun point.</div>';
+    countEl.textContent = `${registry.size}/${MAX_POINTS}`;
+  }
+
+  function download(text,name,type){
+    const b = new Blob([text],{type}); const u = URL.createObjectURL(b);
+    const a=document.createElement('a'); a.href=u; a.download=name; a.click();
+    setTimeout(()=>URL.revokeObjectURL(u), 500);
+  }
+  $('#export-geojson').onclick = async ()=>{
+    // relit la DB pour être sûr d’avoir la dernière vérité
+    const { data } = await sb.from('points').select('lat,lon').eq('map_id', MAP_ID).order('created_at',{ascending:true});
+    const gj = { type:"FeatureCollection", features: data.map(p=>({ type:"Feature", properties:{}, geometry:{ type:"Point", coordinates:[p.lon, p.lat] }})) };
+    download(JSON.stringify(gj,null,2), 'points.geojson', 'application/json');
+  };
+  $('#export-csv').onclick = async ()=>{
+    const { data } = await sb.from('points').select('lat,lon').eq('map_id', MAP_ID).order('created_at',{ascending:true});
+    let csv = 'lat,lon\n' + data.map(p=>`${p.lat},${p.lon}`).join('\n');
+    download(csv, 'points.csv', 'text/csv');
+  };
+  $('#export-kml').onclick = async ()=>{
+    const { data } = await sb.from('points').select('lat,lon').eq('map_id', MAP_ID).order('created_at',{ascending:true});
+    let kml = `<?xml version="1.0" encoding="UTF-8"?><kml xmlns="http://www.opengis.net/kml/2.2"><Document>`;
+    data.forEach((p,i)=> kml += `<Placemark><name>Point ${i+1}</name><Point><coordinates>${p.lon},${p.lat},0</coordinates></Point></Placemark>`);
+    kml += `</Document></kml>`;
+    download(kml,'points.kml','application/vnd.google-earth.kml+xml');
+  };
+  $('#clear').onclick = clearAll;
+
+  // ====== TEMPS RÉEL ======
+  // Met à jour automatiquement quand quelqu’un ajoute/déplace/supprime
+  sb.channel('realtime:points')
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'points', filter: `map_id=eq.${MAP_ID}` }, payload => {
+      const { eventType, new: row, old } = payload;
+      if(eventType === 'INSERT'){
+        if(!registry.has(row.id)){ materializeRow(row); updateList(); }
+      } else if(eventType === 'UPDATE'){
+        const m = registry.get(row.id);
+        if(m){ m.setLatLng([row.lat,row.lon]); updateList(); }
+      } else if(eventType === 'DELETE'){
+        const m = registry.get(old.id);
+        if(m){ pointsGroup.removeLayer(m); registry.delete(old.id); updateList(); }
+      }
+    }).subscribe();
+
+  // Démarrage
+  loadFromDB();
+</script>
+</body>
+</html>
